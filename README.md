@@ -38,71 +38,105 @@ Self-Driving Car Engineer Nanodegree Program
 3. Compile: `cmake .. && make`
 4. Run it: `./mpc`.
 
-## Tips
+## Model predictive control
 
-1. It's recommended to test the MPC on basic examples to see if your implementation behaves as desired. One possible example
-is the vehicle starting offset of a straight line (reference). If the MPC implementation is correct, after some number of timesteps
-(not too many) it should find and track the reference line.
-2. The `lake_track_waypoints.csv` file has the waypoints of the lake track. You could use this to fit polynomials and points and see of how well your model tracks curve. NOTE: This file might be not completely in sync with the simulator so your solution should NOT depend on it.
-3. For visualization this C++ [matplotlib wrapper](https://github.com/lava/matplotlib-cpp) could be helpful.)
-4.  Tips for setting up your environment are available [here](https://classroom.udacity.com/nanodegrees/nd013/parts/40f38239-66b6-46ec-ae68-03afd8a601c8/modules/0949fca6-b379-42af-a919-ee50aa304e6a/lessons/f758c44c-5e40-4e01-93b5-1a82aa4e044f/concepts/23d376c7-0195-4276-bdf0-e02f1f3c665d)
-5. **VM Latency:** Some students have reported differences in behavior using VM's ostensibly a result of latency.  Please let us know if issues arise as a result of a VM environment.
+The dynamics of the car are modelled by the state vector $(x_t, y_t, v_t, \psi_t)$, that denote x and y position, velocity and heading.
 
-## Editor Settings
+The state is extended by two variables:
 
-We've purposefully kept editor configuration files out of this repo in order to
-keep it as simple and environment agnostic as possible. However, we recommend
-using the following settings:
+- $cte_t$: cross-track error: error in between the current y position and the ideal y position (both in the car's coordinate system)  
+- and $e\psi_t$: error in between the current heading and the ideal heading  
 
-* indent using spaces
-* set tab width to 2 spaces (keeps the matrices in source code aligned)
+The ideal y position is determined by fitting a third order polynomial through the waypoints provided by the path planning algorithm. A least-squares solution (through QR decomposition) is used to calculate this. The ideal y position can then be found by using the current x position in the third order polynomial. The results of this polynomial fit is displayed by the yellow line in the video (using some x points ahead of the car as input to the polynomial).
 
-## Code Style
+The ideal heading is determined by the direction coefficient of the tangent of the same third order polynomial at the current x position. The heading can be calculated by $arctan(f'(x))$ where $f(x)$ is the third order polynomial. 
 
-Please (do your best to) stick to [Google's C++ style guide](https://google.github.io/styleguide/cppguide.html).
+The state of the model in the next step is described by the following formula's:
+$$
+x_{t+1} = x_t + v_t * cos(\psi_t) * dt \\
+y_{t+1} = y_t + v_t * sin(\psi_t) * dt \\
+\psi_{t+1} = x_t - (v_t / L_f) * \delta_t * dt \\
+v_{t+1} = v_t + \alpha_t * dt \\
+cte_{t+1} = a_0 + a_1 * x_t + a_2 * x_t^2 + a_3 * x_t^3 - y_t + v_t * sin(e\psi_t) * dt \\
+e\psi_{t+1} = \psi_t - arctan( a_1 + 2 * a_2 * x_t + 3 * a_3 * x_t^2) - (v_t / L_f) * \delta_t * dt
+$$
+Note that the sign of the terms containing $\delta_t$ have been inverted (equations 3 and 6) due to the fact that a positive value denotes counter-clockwise rotation (turning to the left) in the car's coordinate system, while this denotes a right turn in the simulator.
 
-## Project Instructions and Rubric
+Since, we want the heading to be in the car's coordinate system, we convert all waypoints and states to the car's coordinate system. This means that each waypoint $(w_x, w_y)$ is transformed from global coordinates $(w_{x,g}, w_{y,g})$ to car coordinates $(w_{x,c}, w_{y,c})$ like this:
+$$
+w_{x,c} = (w_{x,g} - c_{x,g}) * cos(-\psi) +  (w_{y,g} - c_{y,g}) * sin(-\psi) \\
+w_{x,c} = (w_{x,g} - c_{x,g}) * sin(-\psi) +  (w_{y,g} - c_{y,g}) * cos(-\psi) \\
+$$
+or:
+$$
+w_{x,c} = (w_{x,g} - c_{x,g}) * cos(\psi) -  (w_{y,g} - c_{y,g}) * sin(\psi) \\
+w_{x,c} = -(w_{x,g} - c_{x,g}) * sin(\psi) + (w_{y,g} - c_{y,g}) * cos(\psi) \\
+$$
+The (x, y) position of course becomes (0,0) and the heading of the car becomes 0 radians.
 
-Note: regardless of the changes you make, your project must be buildable using
-cmake and make!
+The outcome of the algorithm is to find good candidates for $\delta_t$ and $\alpha_t$. Non-linear programming using the [Ipopt](http://www.coin-or.org/projects/Ipopt.xml) optimizer) tries to find good candidates based on the aforementioned formula's (which can be converted to constraints by itself, with 0 as lower and upper boundaries), some extra constraints and a cost function that denotes how good the candidates are.
 
-More information is only accessible by people who are already enrolled in Term 2
-of CarND. If you are enrolled, see [the project page](https://classroom.udacity.com/nanodegrees/nd013/parts/40f38239-66b6-46ec-ae68-03afd8a601c8/modules/f1820894-8322-4bb3-81aa-b26b3c6dcbaf/lessons/b1ff3be0-c904-438e-aad3-2b5379f0e0c3/concepts/1a2255a0-e23c-44cf-8d41-39b8a3c8264a)
-for instructions and the project rubric.
+The extra constraints come from physical / technical limitations of the actuators:
 
-## Hints!
+- $-0.436332 * L_f <= \delta <= 0.436332 * L_f$ (-0.436332 radians = 25°)
+- $-1 <= \alpha <= 1$
 
-* You don't have to follow this directory structure, but if you do, your work
-  will span all of the .cpp files here. Keep an eye out for TODOs.
+The cost function that is used is:
+$$
+J= \sum_t(\lambda_1 cte_t^2 + \lambda_2 e\psi_t^2 + \lambda_3 (v_t - v_{ref})^2 + \lambda_4 \delta_t^2 + \lambda_5 \alpha^2 + \lambda_6 (\delta_{t+1} - \delta_t)^2 + \lambda_7 (\alpha_{t+1} - \alpha_t)^2)
+$$
+The lambda's determine the importance we attach to each part of the cast. The first three lambda's try to minimize the errors with the ideal position, heading and reference velocity. The fourth and fifth lambda's try to minimize the occurrence of large steering angles and accelerations. The last two try to minimize the occurrence of large differences in between subsequent steering angles and accelerations.
 
-## Call for IDE Profiles Pull Requests
+The green line that is displayed is based on the predicted (x,y) positions ($N$ in total) that were calculated from the Ipopt optimization. These positions are part of the result vector (stitched after the new model's state) from *MPC::Solve()*.
 
-Help your fellow students!
+### Time step length
 
-We decided to create Makefiles with cmake to keep this project as platform
-agnostic as possible. Similarly, we omitted IDE profiles in order to we ensure
-that students don't feel pressured to use one IDE or another.
+I tried to look one second ahead with ten intervals of 100 ms where the model is evaluated.
 
-However! I'd love to help people get up and running with their IDEs of choice.
-If you've created a profile for an IDE that you think other students would
-appreciate, we'd love to have you add the requisite profile files and
-instructions to ide_profiles/. For example if you wanted to add a VS Code
-profile, you'd add:
+Thus: $N$ = 10 and $dt$ = 0.1
 
-* /ide_profiles/vscode/.vscode
-* /ide_profiles/vscode/README.md
+The fact that a single step is 100 ms proved also convenient when taking latency into account.
 
-The README should explain what the profile does, how to take advantage of it,
-and how to install it.
+### Latency
 
-Frankly, I've never been involved in a project with multiple IDE profiles
-before. I believe the best way to handle this would be to keep them out of the
-repo root to avoid clutter. My expectation is that most profiles will include
-instructions to copy files to a new location to get picked up by the IDE, but
-that's just a guess.
+Since a delay of 100 ms is applied in the program to simulate the latency in the actuator and the latency is of equal to a single time step, I adapted the series of constraints at time steps > 1 :  
+$$
+x_{t+1} - (x_t + v_t * cos(\psi_t) * dt) = 0\\
+y_{t+1} - (y_t + v_t * sin(\psi_t) * dt) = 0\\
+\psi_{t+1} - (x_t - (v_t / L_f) * \delta_{t-1} * dt) = 0\\
+v_{t+1} - (v_t + \alpha_{t-1} * dt) = 0\\
+cte_{t+1} - (a_0 + a_1 * x_t + a_2 * x_t^2 + a_3 * x_t^3 - y_t + v_t * sin(e\psi_t) * dt) = 0 \\
+e\psi_{t+1} - (\psi_t - arctan( a_1 + 2 * a_2 * x_t + 3 * a_3 * x_t^2) - (v_t / L_f) * \delta_{t-1} * dt) = 0
+$$
+To be able to apply the same tactic for time step 1, we retrieve the current steering angle $\delta_c$ and throttle $\alpha_c$ from the websocket's JSON stream and provide it to the MPC algorithm. The equations for time step 1 then become:
 
-One last note here: regardless of the IDE used, every submitted project must
-still be compilable with cmake and make./
+​    
+$$
+x_{1} - (x_0 + v_0 * cos(\psi_0) * dt) = 0\\
+y_{1} - (y_0 + v_0 * sin(\psi_0) * dt) = 0\\
+\psi_{1} - (x_0 - (v_0 / L_f) * \delta_{c} * dt) = 0\\
+v_{1} - (v_0 + \alpha_{c} * dt) = 0\\
+cte_{1} - (a_0 + a_1 * x_t + a_2 * x_t^2 + a_3 * x_t^3 - y_0 + v_0 * sin(e\psi_t) * dt) = 0 \\
+e\psi_{1} - (\psi_0 - arctan( a_1 + 2 * a_2 * x_t + 3 * a_3 * x_t^2) - (v_0 / L_f) * \delta_{c} * dt) = 0
+$$
+It would be a possibility to extend the state from the model from 6 variables to 8 variables (including the previous actuator values), but I added these values as parameters to the *MPC::Solve()* function for simplicity.
 
-## How to write a README
-A well written README file can enhance your project and portfolio.  Develop your abilities to create professional README files by completing [this free course](https://www.udacity.com/course/writing-readmes--ud777).
+In case the latency would be higher than a single time step, then it would be necessary to keep a history of the previous $\delta$ and $\alpha$ values.
+
+### Value of the lambda's
+
+The seven $\lambda_i$ values were determined by trial-and-error:
+
+- They were initialized so that the errors with the ideal position, heading and reference velocity got a high value (with less focus on the velocity, because the most important factor is that the car doesn't leave the track)
+- Also the use of the actuators got some good weights, although these factors are not as important as the first three requirements.
+- Then the $\lambda_i$ values were optimized so that the car follows stays relative close to the yellow line. 
+
+There is of course no single ideal set of  $\lambda_i$ values: you can opt for fast tracks for example (stay close to the reference velocity) or you can put more focus on minimising the position and heading errors or even focus on an optimal driving experience (more of a cruising scenario).
+
+In the end, I choose this set of $\lambda_i$ values (but other sets of values I experimented with, resulted in the good tracks as well):
+
+$(100,100,5,10,10,1,10)$
+
+### Video
+
+A video that made use of the optimizer and the set of parameters discussed above, can be found [here](./result_video.mp4)
